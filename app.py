@@ -6,6 +6,15 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, roc_auc_score, silhouette_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 st.set_page_config(page_title="NYC Yellow Taxi Dashboard", layout="wide")
 
@@ -146,7 +155,58 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["⏱️ Demand over time", "🗺️ Geog
                                         "🤖 Machine learning", "📋 Data"])
 
 with tab1:
-    st.info("V1 heat-map, V2 time series and V3 sunburst will be added here by Sukriye Ipek.")
+    ndays = df.groupby("weekday", observed=True)["date"].nunique()
+    piv = df.pivot_table(index="weekday", columns="hour", values="value", aggfunc="sum", observed=True)
+    piv = piv.reindex(DAYS).fillna(0).div(ndays.reindex(DAYS), axis=0).round(1)
+    fig = px.imshow(piv, aspect="auto", color_continuous_scale="YlOrRd", text_auto=False,
+                    labels=dict(x="Pickup hour", y="", color=f"{metric_name}/day"),
+                    title=f"V1 · Heat-map — average {metric_name} per day by weekday × hour")
+    fig.update_xaxes(dtick=1)
+    st.plotly_chart(style(fig, 400, False), width="stretch")
+    hr = piv.sum(axis=0)
+    wd = piv.sum(axis=1)[ndays.reindex(DAYS).notna()]
+    insight(f"the busiest hour is {hr.idxmax()}:00 and the quietest is {hr.idxmin()}:00. "
+            f"{wd.idxmax()} is the busiest weekday ({fmt(wd.max())} per day on average), "
+            f"{wd.idxmin()} the quietest ({fmt(wd.min())}).")
+
+    c1, c2 = st.columns(2)
+    gran = c1.selectbox("Time resolution", ["Hourly", "Daily"], index=1)
+    logy = c2.checkbox("Logarithmic y-axis", value=False)
+    t = df.assign(t=df["pickup"].dt.floor("h" if gran == "Hourly" else "D"))
+    ts = t.groupby(["t", "pu_borough"])["value"].sum().reset_index()
+    fig = px.line(ts, x="t", y="value", color="pu_borough", color_discrete_map=BOROUGH_COLORS,
+                  title=f"V2 · {gran} {metric_name} by pickup borough",
+                  labels={"value": metric_name, "t": "", "pu_borough": "Borough"})
+    fig.update_xaxes(rangeslider_visible=True,
+                     rangeselector=dict(buttons=[dict(count=7, label="1w", step="day", stepmode="backward"),
+                                                 dict(count=14, label="2w", step="day", stepmode="backward"),
+                                                 dict(step="all")]))
+    if logy:
+        fig.update_yaxes(type="log")
+    st.plotly_chart(style(fig, 520), width="stretch")
+    tot_t = ts.groupby("t")["value"].sum()
+    bsh = ts.groupby("pu_borough")["value"].sum()
+    tf = "%b %d" if gran == "Daily" else "%b %d, %H:00"
+    insight(f"{gran.lower()} {mname} range from {fmt(tot_t.min())} ({tot_t.idxmin():{tf}}) to "
+            f"{fmt(tot_t.max())} ({tot_t.idxmax():{tf}}). {bsh.idxmax()} contributes {bsh.max() / bsh.sum():.0%} of the total"
+            + ("; switch on the log axis to see the smaller boroughs. " if bsh.max() / bsh.sum() > .7 else ". ")
+            + "Use the range slider or the 1w / 2w buttons to zoom.")
+
+    sb = (df.groupby(["pu_borough", "time_of_day", "payment_name"])
+            .agg(value=("value", "sum"), fare=("fare_amount", "mean")).reset_index())
+    fig = px.sunburst(sb, path=["pu_borough", "time_of_day", "payment_name"], values="value", color="fare",
+                      color_continuous_scale="Viridis", title=f"V3 · Sunburst — borough → time of day → payment "
+                                                              f"({metric_name}, colour = avg fare $)")
+    fig.update_coloraxes(colorbar_title="Avg fare $")
+    st.plotly_chart(style(fig, 560, False), width="stretch")
+    tod = df.groupby("time_of_day")["fare_amount"].mean()
+    fb = df.groupby("pu_borough")["fare_amount"].agg(["mean", "size"])
+    fb = fb[fb["size"] >= 30]
+    txt = f"average fare varies between ${tod.min():.1f} and ${tod.max():.1f} across times of day"
+    if len(fb) > 1:
+        txt += (f", but between ${fb['mean'].min():.1f} ({fb['mean'].idxmin()}) and ${fb['mean'].max():.1f} "
+                f"({fb['mean'].idxmax()}) across pickup boroughs")
+    insight(txt + ". Click a ring to drill down.")
 
 with tab2:
     which = st.radio("Map shows", ["Pickups", "Dropoffs"], horizontal=True)
@@ -387,8 +447,141 @@ with tab3:
     if parts_txt:
         insight("; ".join(parts_txt) + ".")
 
+@st.cache_data
+def km_frame(data: pd.DataFrame):
+    x = pd.DataFrame({"log_distance": np.log1p(data["trip_distance"]), "log_duration": np.log1p(data["duration_min"]),
+                      "speed_mph": data["speed_mph"].clip(upper=60), "passengers": data["passenger_count"],
+                      "hour_sin": np.sin(2 * np.pi * data["hour"] / 24), "hour_cos": np.cos(2 * np.pi * data["hour"] / 24)})
+    return StandardScaler().fit_transform(x)
+
+@st.cache_data
+def run_kmeans(data: pd.DataFrame, k: int):
+    Xs = km_frame(data)
+    km = KMeans(n_clusters=k, n_init=5, random_state=42).fit(Xs)
+    sil = silhouette_score(Xs, km.labels_, sample_size=5000, random_state=0)
+    return km.labels_, PCA(n_components=3, random_state=0).fit_transform(Xs), sil
+
+@st.cache_data
+def elbow(data: pd.DataFrame):
+    Xs = km_frame(data)
+    return [KMeans(n_clusters=k, n_init=3, random_state=42).fit(Xs).inertia_ for k in range(2, 9)]
+
+RF_NUM = ["trip_distance", "duration_min", "speed_mph", "passenger_count", "hour", "is_airport"]
+RF_CAT = ["pu_borough", "do_borough", "weekday"]
+
+@st.cache_resource
+def train_rf(data: pd.DataFrame):
+    d = data[data["high_tip"].notna()].copy()
+    d["weekday"] = d["weekday"].astype(str)
+    X, y = d[RF_NUM + RF_CAT], d["high_tip"].astype(int)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=.25, stratify=y, random_state=42)
+    pre = ColumnTransformer([("cat", OneHotEncoder(handle_unknown="ignore"), RF_CAT)], remainder="passthrough")
+    pipe = Pipeline([("pre", pre), ("rf", RandomForestClassifier(
+        n_estimators=150, max_depth=12, min_samples_leaf=20, class_weight="balanced", random_state=42, n_jobs=-1))])
+    pipe.fit(Xtr, ytr)
+    proba = pipe.predict_proba(Xte)[:, 1]
+    pred = (proba >= .5).astype(int)
+    names = pipe.named_steps["pre"].get_feature_names_out()
+    imp = pd.Series(pipe.named_steps["rf"].feature_importances_, index=[n.split("__")[-1] for n in names])
+    imp.index = [next((c for c in RF_CAT if n.startswith(c)), n) for n in imp.index]
+
+    cv = cross_val_score(pipe, Xtr, ytr, cv=StratifiedKFold(3, shuffle=True, random_state=0), scoring="roc_auc")
+    base_pre = ColumnTransformer([("cat", OneHotEncoder(handle_unknown="ignore"), RF_CAT),
+                                  ("num", StandardScaler(), RF_NUM)])
+    lr = Pipeline([("pre", base_pre), ("lr", LogisticRegression(max_iter=1000, class_weight="balanced"))]).fit(Xtr, ytr)
+    lr_auc = roc_auc_score(yte, lr.predict_proba(Xte)[:, 1])
+    extra = dict(cv_mean=float(cv.mean()), cv_std=float(cv.std()), lr_auc=float(lr_auc),
+                 precision=float(precision_score(yte, pred)), recall=float(recall_score(yte, pred)))
+    return (pipe, roc_auc_score(yte, proba), float((pred == yte).mean()), confusion_matrix(yte, pred),
+            imp.groupby(level=0).sum().sort_values(), float(y.mean()), extra)
+
 with tab4:
-    st.info("K-Means clustering and the Random Forest tip model will be added here by Sukriye Ipek.")
+    st.info("ℹ️ **How the sidebar filters affect this tab:** the models are trained once on the full cleaned sample, so their "
+            "results (clusters, silhouette, elbow curve, ROC-AUC, feature importance) do **not** change with the filters. "
+            "Only the K-Means scatter and cluster profile show just the trips that match the current filters.")
+    st.subheader("ML 1 · K-Means trip clustering (unsupervised)")
+    ml_pool = df_all.sample(30000, random_state=7)
+    k = st.slider("Number of clusters (k)", 2, 8, 4)
+    labels, coords, sil = run_kmeans(ml_pool, k)
+    ml = ml_pool.assign(cluster=pd.Categorical(["Cluster " + str(i + 1) for i in labels]),
+                        pc1=coords[:, 0], pc2=coords[:, 1], pc3=coords[:, 2])
+    ml = ml[ml.index.isin(df.index)] if len(df) < len(df_all) else ml
+    if len(ml) < 50:
+        st.info("Too few trips under the current filters for clustering.")
+    else:
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            fig = px.scatter_3d(ml.sample(min(3000, len(ml)), random_state=3), x="pc1", y="pc2", z="pc3",
+                                color="cluster", opacity=.7, category_orders={"cluster": sorted(ml["cluster"].unique())},
+                                hover_data=["trip_distance", "duration_min", "fare_amount", "pu_borough"],
+                                title=f"K-Means (k={k}) in PCA space · silhouette = {sil:.2f}")
+            fig.update_traces(marker_size=3)
+            st.plotly_chart(style(fig, 520), width="stretch")
+        with c2:
+            fig = px.line(x=list(range(2, 9)), y=elbow(ml_pool.sample(10000, random_state=1)), markers=True,
+                          title="Elbow curve (inertia)", labels={"x": "k", "y": "Inertia"})
+            fig.add_vline(x=k, line_dash="dash", line_color="#E45756")
+            st.plotly_chart(style(fig, 250, False), width="stretch")
+            prof = ml.groupby("cluster", observed=True).agg(
+                trips=("hour", "size"), distance_mi=("trip_distance", "mean"), minutes=("duration_min", "mean"),
+                speed_mph=("speed_mph", "mean"), fare=("fare_amount", "mean"), passengers=("passenger_count", "mean"),
+                airport_share=("is_airport", "mean")).round(2)
+            st.markdown("**Cluster profile (means)**")
+            st.dataframe(prof, width="stretch")
+        p_long, p_grp, p_big = prof["distance_mi"].idxmax(), prof["passengers"].idxmax(), prof["trips"].idxmax()
+        insight(f"{p_long} has the longest trips ({prof.loc[p_long, 'distance_mi']:.1f} mi, ${prof.loc[p_long, 'fare']:.0f} fare, "
+                f"{prof.loc[p_long, 'airport_share']:.0%} airport share); {p_grp} has the most passengers "
+                f"({prof.loc[p_grp, 'passengers']:.1f} on average); {p_big} is the largest group ({int(prof.loc[p_big, 'trips']):,} trips). "
+                f"Silhouette = {sil:.2f}.")
+
+    st.divider()
+    st.subheader(f"ML 2 · Random-Forest classifier — will a card-paying rider tip ≥ {TIP_THRESHOLD} %?")
+    pipe, auc, acc, cm, imp, base, ex = train_rf(df_all.sample(80000, random_state=11))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("ROC-AUC (25 % hold-out)", f"{auc:.3f}")
+    m2.metric("3-fold CV ROC-AUC", f"{ex['cv_mean']:.3f} ± {ex['cv_std']:.3f}")
+    m3.metric("Baseline: logistic regression AUC", f"{ex['lr_auc']:.3f}", f"{auc - ex['lr_auc']:+.3f} for the forest", delta_color="off")
+    m4.metric("Share of high tips", f"{base * 100:.1f} %")
+    st.caption(f"At threshold 0.5 the forest reaches accuracy {acc:.3f}, precision {ex['precision']:.3f} and recall {ex['recall']:.3f} "
+               f"for the 'high tip' class. The 'high tip' cut-off ({TIP_THRESHOLD} % of the fare) is a modelling choice.")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(imp, orientation="h", color_discrete_sequence=["#4C78A8"], title="Feature importance",
+                     labels={"value": "Importance", "index": ""})
+        st.plotly_chart(style(fig, 400, False), width="stretch")
+    with c2:
+        fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues", x=["Low tip", "High tip"],
+                        y=["Low tip", "High tip"], title="Confusion matrix (hold-out)",
+                        labels=dict(x="Predicted", y="Actual"))
+        st.plotly_chart(style(fig, 400, False), width="stretch")
+    top2 = imp.sort_values(ascending=False).head(2)
+    level = "strongly" if auc >= .8 else "partly" if auc >= .65 else "only weakly"
+    insight(f"{top2.index[0]} and {top2.index[1]} are the strongest predictors of a high tip (importance {top2.iloc[0]:.2f} and "
+            f"{top2.iloc[1]:.2f}). ROC-AUC = {auc:.2f} (CV {ex['cv_mean']:.2f}) vs {ex['lr_auc']:.2f} for a logistic baseline, "
+            f"so tipping behaviour is {level} predictable.",
+            scope="full sample, model ignores sidebar filters")
+
+    st.markdown("##### 🔮 What-if: probability of a high tip")
+    w1, w2, w3, w4 = st.columns(4)
+    p_dist = w1.slider("Distance (miles)", 0.5, 25.0, 3.0, 0.5)
+    p_hour = w2.slider("Pickup hour", 0, 23, 18)
+    p_pass = w3.slider("Passengers", 1, 6, 1)
+    p_air = w4.checkbox("Airport trip", value=False)
+    b1, b2, b3 = st.columns(3)
+    p_pu = b1.selectbox("Pickup borough", [b for b in boroughs_all if b not in ("Unknown", "N/A")], index=2 if len(boroughs_all) > 2 else 0)
+    p_do = b2.selectbox("Dropoff borough", [b for b in boroughs_all if b not in ("Unknown", "N/A")], index=2 if len(boroughs_all) > 2 else 0)
+    p_day = b3.selectbox("Weekday", DAYS, index=4)
+    speed = float(df_all.loc[df_all["is_airport"] == int(p_air), "speed_mph"].median())
+    row = pd.DataFrame([dict(trip_distance=p_dist, duration_min=p_dist / speed * 60, speed_mph=speed,
+                             passenger_count=p_pass, hour=p_hour, is_airport=int(p_air),
+                             pu_borough=p_pu, do_borough=p_do, weekday=p_day)])
+    prob = pipe.predict_proba(row)[0, 1]
+    gauge = go.Figure(go.Indicator(mode="gauge+number", value=prob * 100, number=dict(suffix=" %"),
+                                   gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="#4C78A8"),
+                                              steps=[dict(range=[0, 33], color="#ffd6d6"),
+                                                     dict(range=[33, 66], color="#fff3bf"),
+                                                     dict(range=[66, 100], color="#d8f3dc")])))
+    st.plotly_chart(style(gauge, 260, False), width="stretch")
 
 with tab5:
     show = df.drop(columns=["value", "pickup", "date"])
