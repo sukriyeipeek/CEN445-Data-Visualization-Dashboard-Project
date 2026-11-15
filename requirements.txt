@@ -1,2 +1,7 @@
 networkx>=3.3
 scikit-learn>=1.5
+streamlit
+plotly
+pandas
+numpy
+pyarrow
