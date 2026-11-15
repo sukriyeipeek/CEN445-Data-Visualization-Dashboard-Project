@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -10,6 +12,11 @@ st.set_page_config(page_title="NYC Yellow Taxi Dashboard", layout="wide")
 DATA = Path(__file__).parent / "data"
 TEMPLATE = "plotly_white"
 TIP_THRESHOLD = 25
+
+BOROUGH_COLORS = {"Manhattan": "#4C78A8", "Brooklyn": "#F2A93B", "Queens": "#54A24B", "Bronx": "#E45756",
+                  "Staten Island": "#B279A2", "EWR": "#17BECF", "Unknown": "#9aa5b1", "N/A": "#9aa5b1"}
+PAY_COLORS = {"Credit card": "#4C78A8", "Cash": "#54A24B", "Flex Fare": "#F2A93B",
+              "Dispute": "#E45756", "No charge": "#9aa5b1"}
 
 PAYMENT = {0: "Flex Fare", 1: "Credit card", 2: "Cash", 3: "No charge", 4: "Dispute"}
 RATECODE = {1: "Standard", 2: "JFK", 3: "Newark", 4: "Nassau/Westchester", 5: "Negotiated", 6: "Group ride",
@@ -23,6 +30,11 @@ def insight(text, scope="current filters"):
 @st.cache_data
 def load_zones():
     return pd.read_csv(DATA / "zones.csv")
+
+@st.cache_resource
+def load_geojson():
+    with open(DATA / "taxi_zones.geojson", encoding="utf-8") as f:
+        return json.load(f)
 
 @st.cache_data
 def load_data():
@@ -79,6 +91,7 @@ def load_data():
 
 df_all, prep_report = load_data()
 zones = load_zones()
+geo = load_geojson()
 
 st.sidebar.title("🎛️ Filters")
 dmin, dmax = df_all["pickup"].min().date(), df_all["pickup"].max().date()
@@ -136,7 +149,149 @@ with tab1:
     st.info("V1 heat-map, V2 time series and V3 sunburst will be added here by Sukriye Ipek.")
 
 with tab2:
-    st.info("V4 map, V5 Sankey and V6 network will be added here by Kaan Gokcek.")
+    which = st.radio("Map shows", ["Pickups", "Dropoffs"], horizontal=True)
+    location_col = "PULocationID" if which == "Pickups" else "DOLocationID"
+    zagg = df.groupby(location_col).agg(
+        value=("value", "sum"), trips=("value", "size"), fare=("fare_amount", "mean")).reset_index()
+    zagg = zagg.merge(zones[["LocationID", "Zone", "Borough"]],
+                      left_on=location_col, right_on="LocationID", how="left")
+    zagg[["Zone", "Borough"]] = zagg[["Zone", "Borough"]].fillna("Unknown")
+    cap = float(zagg["value"].quantile(.95))
+    fig = px.choropleth(
+        zagg, geojson=geo, locations=location_col, color="value", range_color=(0, max(cap, 1e-9)),
+        color_continuous_scale="YlOrRd", hover_name="Zone",
+        hover_data={location_col: False, "Borough": True, "value": ":,.0f", "trips": ":,",
+                    "fare": ":.2f"},
+        labels={"value": metric_name, "trips": "Trips", "fare": "Avg fare $"},
+        title=f"V4 · Geographic map — {which.lower()} by taxi zone "
+              f"({metric_name}; colour capped at 95th percentile)")
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_traces(marker_line_width=0.3, marker_line_color="white")
+    st.plotly_chart(style(fig, 640, False), width="stretch")
+    t5 = zagg.nlargest(5, "value")
+    share = t5["value"].sum() / zagg["value"].sum() if zagg["value"].sum() else 0.0
+    insight(f"{t5.iloc[0]['Zone']} is the top {which.lower()[:-1]} zone "
+            f"({fmt(t5.iloc[0]['value'])}); the top {len(t5)} zones by {mname} "
+            f"account for {share:.0%} of the filtered total.")
+
+    f1 = df.groupby(["pu_borough", "do_borough"])["value"].sum().reset_index()
+    f2 = df.groupby(["do_borough", "payment_name"])["value"].sum().reset_index()
+    nodes = {}
+
+    def nid(kind, name):
+        return nodes.setdefault((kind, name), len(nodes))
+
+    src = [nid("pu", a) for a in f1.pu_borough] + [nid("do", a) for a in f2.do_borough]
+    tgt = [nid("do", b) for b in f1.do_borough] + [nid("pay", b) for b in f2.payment_name]
+    val = list(f1["value"]) + list(f2["value"])
+    labels = [{"pu": f"{n} (pickup)", "do": f"{n} (dropoff)", "pay": n}[k] for k, n in nodes]
+    ncol = [(PAY_COLORS if k == "pay" else BOROUGH_COLORS).get(n, "#9aa5b1") for k, n in nodes]
+    lcol = [f"rgba({int(ncol[s][1:3], 16)},{int(ncol[s][3:5], 16)},"
+            f"{int(ncol[s][5:7], 16)},0.4)" for s in src]
+    fig = go.Figure(go.Sankey(
+        node=dict(label=labels, color=ncol, pad=14, thickness=16),
+        link=dict(source=src, target=tgt, value=val, color=lcol)))
+    fig.update_layout(title=f"V5 · Sankey — pickup borough → dropoff borough → payment type ({metric_name})")
+    st.plotly_chart(style(fig, 520, False), width="stretch")
+    flow_total = f1["value"].sum()
+    same = f1.loc[f1["pu_borough"] == f1["do_borough"], "value"].sum() / flow_total if flow_total else 0.0
+    big = f1.nlargest(1, "value").iloc[0]
+    pay = f2.groupby("payment_name")["value"].sum()
+    big_share = big["value"] / flow_total if flow_total else 0.0
+    pay_share = pay.max() / pay.sum() if pay.sum() else 0.0
+    insight(f"{same:.0%} of {mname} are within the same borough; the largest flow is "
+            f"{big['pu_borough']} → {big['do_borough']} ({big_share:.0%}); "
+            f"{pay.idxmax()} is the main payment type ({pay_share:.1%}).")
+
+    st.markdown("#### V6 · Network — trip flows between the busiest taxi zones")
+    n1, n2, n3, n4 = st.columns(4)
+    topn = n1.slider("Number of busiest zones", 10, 60, 30, 5)
+    minlink = n2.slider("Minimum trips on a link", 1, 40, 8)
+    node_color = n3.radio("Colour nodes by", ["Borough", "Community"], horizontal=True)
+    node_size = n4.radio("Size nodes by", ["Trips", "Betweenness"], horizontal=True)
+    tot = pd.concat([df["PULocationID"], df["DOLocationID"]]).value_counts()
+    top = set(tot.head(topn).index)
+    fl = df[(df["PULocationID"] != df["DOLocationID"])
+            & df["PULocationID"].isin(top) & df["DOLocationID"].isin(top)]
+    a = np.minimum(fl["PULocationID"], fl["DOLocationID"])
+    b = np.maximum(fl["PULocationID"], fl["DOLocationID"])
+    ed = fl.groupby([a.rename("a"), b.rename("b")]).size().reset_index(name="n")
+    located = zones.dropna(subset=["lat", "lon"]).set_index("LocationID")
+    ed = ed[(ed["n"] >= minlink) & ed["a"].isin(located.index) & ed["b"].isin(located.index)]
+    ed = ed.nlargest(250, "n")
+    G = nx.Graph()
+    for r in ed.itertuples():
+        G.add_edge(int(r.a), int(r.b), weight=int(r.n), dist=1.0 / int(r.n))
+    if G.number_of_edges():
+        strength = dict(G.degree(weight="weight"))
+        betw = nx.betweenness_centrality(G, weight="dist")
+        comms = list(nx.community.greedy_modularity_communities(G, weight="weight"))
+        comm_of = {n: i + 1 for i, c in enumerate(comms) for n in c}
+        modularity = nx.community.modularity(G, comms, weight="weight")
+    else:
+        strength, betw, comm_of, comms, modularity = {}, {}, {}, [], 0.0
+
+    fig = go.Figure()
+    if len(ed):
+        ed["bucket"] = np.ceil(5 * ed["n"] / ed["n"].max()).clip(1, 5).astype(int)
+        for bk, g in ed.groupby("bucket"):
+            xs, ys = [], []
+            for r in g.itertuples():
+                xs += [located.loc[r.a, "lon"], located.loc[r.b, "lon"], None]
+                ys += [located.loc[r.a, "lat"], located.loc[r.b, "lat"], None]
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines", hoverinfo="skip", showlegend=False,
+                line=dict(width=0.8 + 1.7 * bk, color=f"rgba(90,100,110,{0.18 + 0.1 * bk})")))
+    nd = located.loc[located.index.isin(G.nodes)].reset_index().copy()
+    nd["trips"] = nd["LocationID"].map(tot)
+    nd["strength"] = nd["LocationID"].map(strength).fillna(0)
+    nd["betweenness"] = nd["LocationID"].map(betw).fillna(0.0)
+    nd["community"] = nd["LocationID"].map(comm_of).fillna(0).astype(int)
+    size_col = "trips" if node_size == "Trips" else "betweenness"
+    max_size = nd[size_col].max() if len(nd) else 0.0
+    nd["msize"] = 8 + 30 * nd[size_col] / max(max_size, 1e-9)
+    if node_color == "Borough":
+        groups = [(bor, BOROUGH_COLORS.get(bor, "#9aa5b1"), g) for bor, g in nd.groupby("Borough")]
+    else:
+        pal = px.colors.qualitative.Bold
+        groups = [(f"Community {c}", pal[(c - 1) % len(pal)], g) for c, g in nd.groupby("community")]
+    for name, colr, g in groups:
+        fig.add_trace(go.Scatter(
+            x=g["lon"], y=g["lat"], mode="markers", name=name,
+            marker=dict(size=g["msize"], color=colr, line=dict(width=1.2, color="white")),
+            text=g["Zone"],
+            customdata=np.column_stack([g["trips"], g["strength"], g["betweenness"],
+                                        g["community"], g["Borough"]]),
+            hovertemplate="<b>%{text}</b> (%{customdata[4]})<br>%{customdata[0]:,} trip ends"
+                          "<br>Weighted degree: %{customdata[1]:,}"
+                          "<br>Betweenness: %{customdata[2]:.3f}"
+                          "<br>Community: %{customdata[3]}"
+                          f"<br>Graph modularity Q: {modularity:.3f}<extra></extra>"))
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False, scaleanchor="x", scaleratio=1.32)
+    fig.update_layout(
+        title="Zones placed at their real coordinates · link width = trips in either direction · "
+              f"node size = {node_size.lower()}, colour = {node_color.lower()}",
+        plot_bgcolor="#f6f8fa")
+    st.plotly_chart(style(fig, 640), width="stretch")
+    if len(ed):
+        strongest = ed.nlargest(1, "n").iloc[0]
+        bridge = max(betw, key=betw.get)
+        hub = max(strength, key=strength.get)
+        insight(f"{len(ed)} links connect {G.number_of_nodes()} zones; the strongest corridor is "
+                f"{located.loc[int(strongest['a']), 'Zone']} ↔ {located.loc[int(strongest['b']), 'Zone']} "
+                f"({int(strongest['n'])} trips); density is {nx.density(G):.2f}, "
+                f"{located.loc[hub, 'Zone']} is the biggest hub (weighted degree {strength[hub]:,}), "
+                f"{located.loc[bridge, 'Zone']} is the strongest bridge (betweenness {betw[bridge]:.2f}), "
+                f"and greedy modularity finds {len(comms)} communities (Q = {modularity:.2f}).")
+        with st.expander("Network metrics per zone (top 10 by betweenness)"):
+            tbl = nd.sort_values("betweenness", ascending=False).head(10)[
+                ["Zone", "Borough", "trips", "strength", "betweenness", "community"]].rename(
+                columns={"trips": "Trip ends", "strength": "Weighted degree",
+                         "betweenness": "Betweenness", "community": "Community"})
+            st.dataframe(tbl.round(3), hide_index=True, width="stretch")
+    else:
+        insight("No link with coordinates reaches the current minimum; lower the minimum-trips slider or widen the filters.")
 
 card = df[df["tip_pct"].notna()]
 with tab3:
