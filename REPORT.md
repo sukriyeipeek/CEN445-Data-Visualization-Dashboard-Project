@@ -1,6 +1,6 @@
 # CEN445 – Exploratory Data Visualization Dashboard: One-Page Report
 
-**Team:** Şükriye İpek (2022555033), Kaan Gökçek (2022555026), Yusuf İzzeddin Fırat (2022555040)· **GitHub:** https://github.com/sukriyeipeek/CEN445-Data-Visualization-Dashboard-Project
+**Team:** Şükriye İpek (2022555033), Kaan Gökçek (2022555026), Yusuf İzzeddin Fırat (2023555040)· **GitHub:** https://github.com/sukriyeipeek/CEN445-Data-Visualization-Dashboard-Project
 
 ## Dataset and context
 We use the **NYC TLC Yellow Taxi Trip Records for January 2025**, published by the NYC Taxi & Limousine Commission. The full file has 3.47 million trips and 20 columns: pickup and dropoff times and zones, distance, fare, tip, tolls, total amount, passenger count, payment type and rate code. Zone names come from the TLC zone lookup table, and zone shapes come from NYC Open Data. To keep the dashboard fast, we work on a random sample of **150,000 trips** (fixed seed 445).
